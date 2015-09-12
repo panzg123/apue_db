@@ -331,6 +331,7 @@ _db_readptr(DB *db, off_t offset)
 	if (read(db->idxfd, asciiptr, PTR_SZ) != PTR_SZ)
 		err_dump("_db_readptr: read error of ptr field");
 	asciiptr[PTR_SZ] = 0;		/* null terminate */
+	//将指针从ASCII形式变换为长整型
 	return(atol(asciiptr));
 }
 

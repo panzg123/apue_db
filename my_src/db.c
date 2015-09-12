@@ -13,52 +13,7 @@
 #include<errno.h>
 #include<sys/uio.h>
 
-/*内部索引文件常量*/
-#define IDXLEN_SZ	   4	/* index record length (ASCII chars) */
-#define SEP         ':'	/* separator char in index record */
-#define SPACE       ' '	/* space character */
-#define NEWLINE     '\n'	/* newline character */
 
-#define PTR_SZ        6	/* size of ptr field in hash chain */
-#define PTR_MAX  999999	/* max file offset = 10**PTR_SZ - 1 */
-#define NHASH_DEF	 137	/* default hash table size */
-#define FREE_OFF      0	/* free list offset in index file */
-#define HASH_OFF PTR_SZ	/* hash table offset in index file */
-
-
-typedef unsigned long BDHASH;    /*hash value*/
-typedef unsigned long COUNT;    /*unsigned counter*/
-
-/*db结构记录一个打开数据库的所有信息*/
-typedef struct DB{
-	int idxfd;     /*索引文件指针*/
-	int datfd;    /*数据文件指针*/
-	char *idxbuf;    /*索引记录缓冲区*/
-	char *datbuf;      /*指针记录缓冲区*/
-	char *name;
-	off_t idxoff;		/*索引偏移量*/
-	size_t idxlen;   /*索引长度*/
-
-	off_t datoff;   /*数据偏移量*/
-	size_t datlen; /*数据长度*/
-
-	off_t ptrval;
-	off_t ptroff;
-	off_t chainoff;
-	off_t hashoff;
-	BDHASH nhash;
-	COUNT nhash;
-	 COUNT  cnt_delok;    /* delete OK */
-	  COUNT  cnt_delerr;   /* delete error */
-	  COUNT  cnt_fetchok;  /* fetch OK */
-	  COUNT  cnt_fetcherr; /* fetch error */
-	  COUNT  cnt_nextrec;  /* nextrec */
-	  COUNT  cnt_stor1;    /* store: DB_INSERT, no empty, appended */
-	  COUNT  cnt_stor2;    /* store: DB_INSERT, found empty, reused */
-	  COUNT  cnt_stor3;    /* store: DB_REPLACE, diff len, appended */
-	  COUNT  cnt_stor4;    /* store: DB_REPLACE, same len, overwrote */
-	  COUNT  cnt_storerr;  /* store error */
-}DB;
 
 /*
  * internal functions
@@ -170,5 +125,126 @@ static DB* _db_alloc(int namelen)
 }
 void db_close(DBHANDLE h)
 {
+	_db_free((DB*)h);    /*在free中关闭fds，并释放结构体和相应缓冲区*/
+}
+
+/*
+ * 先释放缓冲区，然后删除结构体
+ */
+static void _db_free(DB *db)
+{
+	if(db->idxfd >=0)
+		close(db->idxfd);
+	if(db->datfd>=0)
+		close(db->datfd);
+	if(db->idxbuf != NULL)
+		free(db->idxbuf);
+	if(db->datbuf != NULL)
+		free(db->datbuf);
+	if(db->name!=NULL)
+		free(db->name);
+	free(db);
+}
+
+char * db_fetch(DBHANDLE h,const char * key)
+{
+	DB *db =h;
+	char *ptr;
+	/*error, record not found*/
+	if(_db_find_and_lock(db,key,0)<0)
+	{
+		ptr = NULL;
+		db->cnt_fetcherr++;
+	}
+	else
+	{
+		ptr= _db_readdat(db);   /*return pointer to data*/
+		db->cnt_fetchok++;
+	}
+	/*unlock the hash chain that _db_find_an_lock locked*/
+	if(unlock(db->idxfd,db->chainoff,SEEK_SET)<0)
+		err_dump("db_fetch: unlock error");
+	return (ptr);
+}
+static int _db_find_and_lock(DB* db,const char* key,int writelock)
+{
+	off_t offset,nextoffset;
+	//计算hash值
+	db->chainoff = (_db_hash(db,key)*PTR_SZ)+db->hashoff;
+	db->ptroff = db->chainoff;
+	if(writelock)
+	{
+		if(write_lock(db->idxfd,db->chainoff,SEEK_SET,1)<0)
+			err_dump("_db_find_and_lock: writew_lock error");
+	}
+	else
+	{
+		if(readw_lock(db->idxfd,db->chainoff,SEEK_SET,1)<0)
+			err_dump("_db_find_and_lock: readw_lock error");
+	}
+	//获取偏移值
+	offset = _db_readptr(db,db->ptroff);
+	while(offset!=0)
+	{
+		nextoffset = _db_readidx(db,offset);
+		if(strcmp(db->idxbuf,key)==0)
+			break;    /*找到匹配*/
+		db->ptroff = offset;
+		offset = nextoffset;
+	}
+	//offset ==0 返回错误
+	return (offset ==0 ? -1:0);
+}
+
+static DBHASH _db_hash(DB* db,const char* key)
+{
+	DBHASH hval =0;
+	char c;
+	int i;
+
+	/* ASCII 字符乘以序号，在将结果加起来，除以散列表的纪录项数目
+	 * 作为散列值，散列表记录项为１３７素数，提供较好的分布特性*/
+	for (i = 0; (c=*key++)!=0; ++i) {
+		hval +=c*i;
+	}
+	return (hval% db->nhash);
+}
+/*读取三种不同的链表指针*/
+static off_t  _db_readptr(DB* db,off_t offset)
+{
+	char asciiptr[PTR_SZ+1];
+	if(lseek(db->idxfd,offset,SEEK_SET)==-1)
+		err_dump("_db_readptr: lseek error to ptr field");
+	if(read(db->idxfd,asciiptr,PTR_SZ)!=PTR_SZ)
+		err_dump("_db_readptr: read error of ptr field");
+	asciiptr[PTR_SZ]=0;  //NULL terminate
+	return (atol(asciiptr));
+}
+
+/*从索引文件指针的偏移量读取索引记录*/
+static off_t _db_readidx(DB* db,off_t offset)
+{
+	ssize_t i;
+	char *ptr1,*ptr2;
+	char asciiptr[PTR_SZ+1],asciilen[IDXLEN_SZ+1];
+	struct iovec iov[2];
+
+	//0 表示从当前偏移量处读取
+	if((db->idxoff == lseek(db->idxfd,offset,
+			offset ==0 ? SEEK_CUR:SEEK_SET))==-1)
+		err_dump("_db_readidx: lseek error");
+	//读取两个定长字段
+	iov[0].iov_base =asciiptr;
+	iov[0].iov_len =PTR_SZ;
+	iov[1].iov_base = asciilen;
+	iov[1].iov_len = IDXLEN_SZ;
+	//用readv是分散读，从不同的内存处读取数据
+	//返回值是读取的字节数目
+	if((i=readv(db->idxfd,&iov[0],2))!=PTR_SZ+IDXLEN_SZ)
+	{
+		if(1==0 &&offset ==0)
+			return -1;
+		err_dump("_db_readidx:readv error of index record");
+	}
 
 }
