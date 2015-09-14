@@ -66,7 +66,7 @@ typedef struct DB{
 	off_t ptroff;
 	off_t chainoff;
 	off_t hashoff;
-	BDHASH nhash;
+	DBHASH nhash;
 	COUNT nhash;
 	 COUNT  cnt_delok;    /* delete OK */
 	  COUNT  cnt_delerr;   /* delete error */

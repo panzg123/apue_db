@@ -5,8 +5,8 @@
  *      Author: panzg
  */
 
-#include"db.h"
-#include"head.h"
+#include"include/db.h"
+#include"include/head.h"
 
 #include<fcntl.h>
 #include<stdarg.h>
@@ -21,7 +21,7 @@ static void _db_dodelete(DB*);
 static int _db_find_and_lock(DB*, const char*, int);
 static int _db_findfree(DB*, int, int);
 static void _db_free(DB*);
-static BDHASH _db_hash(DB*, const char*);
+static DBHASH _db_hash(DB*, const char*);
 static char* _db_readdat(DB*);
 static off_t *_db_readidx(DB*, off_t);
 static off_t _db_readptr(DB*, off_t);
@@ -323,5 +323,272 @@ static void _db_dodelete(DB *db)
 	while(*ptr)
 		*ptr++=SPACE;
 	//调用writew_lock对空闲链表枷锁
+	if(writew_lock(db->idxfd,FREE_OFF,SEEK_SET,1)<0)
+		err_dump("_db_dodelete:writew_lock error");
+	//清空数据记录
+	_db_writedat(db,db->datbuf,db->datoff,SEEK_SET);
+	freeptr = _db_readptr(db,FREE_OFF);
+	saveptr=db->ptrval;
+	_db_writeidx(db,db->idxbuf,db->idxoff,SEEK_SET,freeptr);
+	_db_writeptr(db,FREE_OFF,db->idxoff);
+	//修改散列链中前一条记录的指针，使其正好指向删除之后的一条记录
+	_db_writeptr(db,db->ptroff,saveptr);
 
+	if(un_lock(db->idxfd,FREE_OFF,SEEK_SET,1)<0)
+		err_dump("_db_dodelete : unlock error");
+}
+
+static void _db_writedat(DB *db,const char *data,off_t offset,int whence)
+{
+	struct iovec iov[2];
+	static char newline = NEWLINE;
+	//如果是增加append记录，需要枷锁；如果是重写记录，则不需要加锁
+	if(whence==SEEK_END)
+		if(writew_lock(db->datfd,0,SEEK_SET,0)<0)
+			err_dump("_db_writedat:writew_lock error");
+
+	if((db->datoff = lseek(db->datfd,offset,whence))==-1)
+		err_dump("_db_writedat:lseek error");
+	db->datlen = strlen(data)+1;
+
+	iov[0].iov_base = (char*)data;
+	iov[0].iov_len=db->datlen-1;
+	iov[1].iov_base=&newline;
+	iov[1].iov_len = 1;
+	if(writev(db->datfd,&iov[0],2)!=db->datlen)
+		err_dump("_db_writedat:writev error of data record");
+	if(whence==SEEK_END)
+		if(un_lock(db->datfd,0,SEEK_SET,0)<0)
+			err_dump("_db_writedat:un_lock error");
+}
+
+static void _db_writeidx(DB *db,const char* key,off_t offset,int whence,off_t ptrval)
+{
+	struct iovec iov[2];
+	char asciiptrlen[PTR_SZ+IDXLEN_SZ+1];
+	int len;
+	char *fmt;
+
+	if((db->ptrval = ptrval)<0 || ptrval>PTR_MAX)
+		err_quit("_db_writeidx: invalid ptr: %d", ptrval);
+	if (sizeof(off_t) == sizeof(long long))
+		fmt = "%s%c%lld%c%d\n";
+	else
+		fmt = "%s%c%ld%c%d\n";
+	sprintf(asciiptrlen, "%*ld%*d", PTR_SZ, ptrval, IDXLEN_SZ, len);
+	//如果是appending,就得加锁
+	if (whence == SEEK_END)		/* we're appending */
+			if (writew_lock(db->idxfd, ((db->nhash+1)*PTR_SZ)+1,
+			  SEEK_SET, 0) < 0)
+				err_dump("_db_writeidx: writew_lock error");
+
+	/*
+	 * Position the index file and record the offset.
+	 */
+	if ((db->idxoff = lseek(db->idxfd, offset, whence)) == -1)
+		err_dump("_db_writeidx: lseek error");
+
+	iov[0].iov_base = asciiptrlen;
+	iov[0].iov_len = PTR_SZ + IDXLEN_SZ;
+	iov[1].iov_base = db->idxbuf;
+	iov[1].iov_len = len;
+	if (writev(db->idxfd, &iov[0], 2) != PTR_SZ + IDXLEN_SZ + len)
+		err_dump("_db_writeidx: writev error of index record");
+
+	if (whence == SEEK_END)
+		if (un_lock(db->idxfd, ((db->nhash+1)*PTR_SZ)+1,
+				SEEK_SET, 0) < 0)
+			err_dump("_db_writeidx: un_lock error");
+}
+/*将一个链表指针写入到索引文件中*/
+static void _db_writeptr(DB *db,off_t offset,off_t ptrval)
+{
+	char asciiptr[PTR_SZ+1];
+	if(ptrval<0 || ptrval>PTR_MAX)
+		err_quit("_Db_writeptr:invalid ptr:%d",ptrval);
+	sprintf(asciiptr,"%*ld",PTR_SZ,ptrval);
+
+	if(lseek(db->idxfd,offset,SEEK_SET)==-1)
+		err_dump("_db_writeptr: lseek error to ptr field");
+	if (write(db->idxfd, asciiptr, PTR_SZ) != PTR_SZ)
+		err_dump("_db_writeptr: write error of ptr field");
+}
+
+/*
+ * 在数据库中插入一条新的记录
+ * return : 0代表正常，１代表存在但是DB_INSERT被制定，－１代表出错．
+ */
+int db_store(DBHANDLE h,const char* key,const char*data,int flag)
+{
+	DB *db =h;
+	int rc,keylen,datlen;
+	off_t ptrval;
+
+	//先验证flag是够有效
+	if(flag != DB_INSERT && flag!=DB_REPLACE && flag!=DB_STORE)
+	{
+		errno =EINVAL;
+	    return (-1);
+	}
+	keylen =strlen(key);
+	datlen = strlen(data)+1;
+	if (datlen < DATLEN_MIN || datlen > DATLEN_MAX)
+		err_dump("db_store: invalid data length");
+	if(_db_find_and_lock(db,key,1)<0)          /*未找到*/
+	{
+		if(flag == DB_REPLACE)
+		{
+			rc = -1;
+			db->cnt_storerr++;
+			errno = ENOENT;
+			goto doreturn;
+		}
+		ptrval = _db_readptr(db,db->chainoff);
+		if(_db_findfree(db,keylen,datlen)<0)
+		{
+			//第一种情况
+			//没有找到对应大小的记录，则需要查到尾部
+			_db_writedat(db,data,0,SEEK_END);
+			_db_writeidx(db,key,0,SEEK_END,ptrval);
+
+			_db_writeptr(db,db->chainoff,db->idxoff);
+			db->cnt_stor1++;
+		}
+		else
+		{
+			//第二种情况
+			//找到了对应大小的空记录
+			_db_writedat(db,data,db->datoff,SEEK_SET);
+			_db_writeidx(db,key,db->idxoff,SEEK_SET,ptrval);
+			_db_writeptr(db,db->chainoff,db->idxoff);
+			db->cnt_stor2++;
+		}
+	}
+	else
+	{
+		if(flag == DB_INSERT)   /*记录已经存在，flag不能为db_insert*/
+		{
+			rc=1;
+			db->cnt_storerr++;
+			goto doreturn;
+		}
+		//第三种情况,替换，且记录长度不一致，此时，需要先将老记录删除，然后写索引和数据
+		if(datlen!=db->datlen)
+		{
+			_db_dodelete(db);
+			ptrval = _db_readptr(db,db->chainoff);
+			_db_writedat(db,data,0,SEEK_END);
+			_db_writeidx(db,key,0,SEEK_END,ptrval);
+			_db_writeptr(db,db->chainoff,db->idxoff);
+			db->cnt_stor3++;
+		}
+		//第四种情况,长度恰好一致，只需要重写数据即可．
+		else
+		{
+			_db_writedat(db,data,db->datoff,SEEK_SET);
+			db->cnt_stor4++;
+		}
+	}
+	//公共处理逻辑，包括解锁
+	doreturn:
+	if(un_lock(db->idxfd,db->chainoff,SEEK_SET,1)<0)
+		err_dump("db_store: un_lock error");
+	return (rc);
+}
+//找到一个指定的大小的空闲索引记录，以及相关联的数据记录
+static int _db_findfree(DB *db,int keylen,int datlen)
+{
+	int rc;
+	off_t offset,nextoffset,saveoffset;
+	if(writew_lock(db->idxfd,FREE_OFF,SEEK_SET,1)<0)
+		err_dump("_db_findfree: writew_lock error");
+	saveoffset = FREE_OFF;
+	offset = _db_readptr(db,saveoffset);
+
+	while (offset != 0) {
+		nextoffset = _db_readidx(db, offset);
+		if (strlen(db->idxbuf) == keylen && db->datlen == datlen)
+			break;		/* found a match */
+		saveoffset = offset;
+		offset = nextoffset;
+	}
+
+	if (offset == 0) {
+		rc = -1;	/* no match found */
+	} else {
+		/*
+		 * Found a free record with matching sizes.
+		 * The index record was read in by _db_readidx above,
+		 * which sets db->ptrval.  Also, saveoffset points to
+		 * the chain ptr that pointed to this empty record on
+		 * the free list.  We set this chain ptr to db->ptrval,
+		 * which removes the empty record from the free list.
+		 */
+		_db_writeptr(db, saveoffset, db->ptrval);
+		rc = 0;
+
+		/*
+		 * Notice also that _db_readidx set both db->idxoff
+		 * and db->datoff.  This is used by the caller, db_store,
+		 * to write the new index record and data record.
+		 */
+	}
+
+	/*
+	 * Unlock the free list.
+	 */
+	if (un_lock(db->idxfd, FREE_OFF, SEEK_SET, 1) < 0)
+		err_dump("_db_findfree: un_lock error");
+	return(rc);
+}
+//将数据库重置到初始状态，将索引文件的文件偏移量定位到索引文件的第一条记录
+void rewind(DBHANDLE h)
+{
+	DB *db =h;
+	off_t offset;
+	offset = (db->nhash+1)*PTR_SZ;
+
+	if((db->idxoff=lseek(db->idxfd,offset+1,SEEK_SET))==-1)
+		err_dump("_db_rewind:lseek error");
+}
+//返回数据库的下一条记录，返回值是指向数据的指针
+char *db_nextrec(DBHANDLE h,char*key)
+{
+	DB		*db = h;
+		char	c;
+		char	*ptr;
+
+		/*
+		 * We read lock the free list so that we don't read
+		 * a record in the middle of its being deleted.
+		 */
+		if (readw_lock(db->idxfd, FREE_OFF, SEEK_SET, 1) < 0)
+			err_dump("db_nextrec: readw_lock error");
+
+		do {
+			/*
+			 * Read next sequential index record.
+			 */
+			if (_db_readidx(db, 0) < 0) {
+				ptr = NULL;		/* end of index file, EOF */
+				goto doreturn;
+			}
+
+			/*
+			 * Check if key is all blank (empty record).
+			 */
+			ptr = db->idxbuf;
+			while ((c = *ptr++) != 0  &&  c == SPACE)
+				;	/* skip until null byte or nonblank */
+		} while (c == 0);	/* loop until a nonblank key is found */
+
+		if (key != NULL)
+			strcpy(key, db->idxbuf);	/* return key */
+		ptr = _db_readdat(db);	/* return pointer to data buffer */
+		db->cnt_nextrec++;
+
+	doreturn:
+		if (un_lock(db->idxfd, FREE_OFF, SEEK_SET, 1) < 0)
+			err_dump("db_nextrec: un_lock error");
+		return(ptr);
 }
