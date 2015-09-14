@@ -23,7 +23,7 @@ static int _db_findfree(DB*, int, int);
 static void _db_free(DB*);
 static DBHASH _db_hash(DB*, const char*);
 static char* _db_readdat(DB*);
-static off_t *_db_readidx(DB*, off_t);
+static off_t  _db_readidx(DB*, off_t);
 static off_t _db_readptr(DB*, off_t);
 static void _db_writedat(DB*, const char*, off_t, int);
 static void _db_writeidx(DB*, const char*, off_t, int, off_t);
@@ -32,7 +32,7 @@ static void _db_writeptr(DB *, off_t, off_t);
 /*
  * open or create a database
  */
-DBHANDLE db_open(const char* pathname, int oflags, ...)
+DBHANDLE db_open_error(const char* pathname, int oflags, ...)
 {
 	DB *db;
 	int len, mode;
@@ -101,7 +101,89 @@ DBHANDLE db_open(const char* pathname, int oflags, ...)
 	db_rewind(db);
 	return (db);
 }
+DBHANDLE db_open(const char *pathname, int oflag, ...)
+{
+	DB			*db;
+	int			len, mode;
+	size_t		i;
+	char		asciiptr[PTR_SZ + 1],
+				hash[(NHASH_DEF + 1) * PTR_SZ + 2];
+					/* +2 for newline and null */
+	struct stat	statbuff;
 
+	/*
+	 * Allocate a DB structure, and the buffers it needs.
+	 */
+	len = strlen(pathname);
+	if ((db = _db_alloc(len)) == NULL)
+		err_dump("db_open: _db_alloc error for DB");
+
+	//初始化db
+	db->nhash   = NHASH_DEF;/* hash table size */
+	db->hashoff = HASH_OFF;	/* offset in index file of hash table */
+	strcpy(db->name, pathname);
+	strcat(db->name, ".idx");
+
+	if (oflag & O_CREAT) {
+		va_list ap;
+
+		va_start(ap, oflag);
+		mode = va_arg(ap, int);
+		va_end(ap);
+
+		/*
+		 * Open index file and data file.
+		 */
+		db->idxfd = open(db->name, oflag, mode);
+		strcpy(db->name + len, ".dat");
+		db->datfd = open(db->name, oflag, mode);
+	} else {
+		/*
+		 * Open index file and data file.
+		 */
+		db->idxfd = open(db->name, oflag);
+		strcpy(db->name + len, ".dat");
+		db->datfd = open(db->name, oflag);
+	}
+
+	if (db->idxfd < 0 || db->datfd < 0) {
+		_db_free(db);
+		return(NULL);
+	}
+
+	if ((oflag & (O_CREAT | O_TRUNC)) == (O_CREAT | O_TRUNC)) {
+		/*
+		 * If the database was created, we have to initialize
+		 * it.  Write lock the entire file so that we can stat
+		 * it, check its size, and initialize it, atomically.
+		 */
+		if (writew_lock(db->idxfd, 0, SEEK_SET, 0) < 0)
+			err_dump("db_open: writew_lock error");
+
+		if (fstat(db->idxfd, &statbuff) < 0)
+			err_sys("db_open: fstat error");
+
+		if (statbuff.st_size == 0) {
+			/*
+			 * We have to build a list of (NHASH_DEF + 1) chain
+			 * ptrs with a value of 0.  The +1 is for the free
+			 * list pointer that precedes the hash table.
+			 */
+			sprintf(asciiptr, "%*d", PTR_SZ, 0);
+			hash[0] = 0;
+			for (i = 0; i < NHASH_DEF + 1; i++)
+				strcat(hash, asciiptr);
+			strcat(hash, "\n");
+			i = strlen(hash);
+			if (write(db->idxfd, hash, i) != i)
+				err_dump("db_open: index file init write error");
+		}
+		if (un_lock(db->idxfd, 0, SEEK_SET, 0) < 0)
+			err_dump("db_open: un_lock error");
+	}
+	db_rewind(db);
+	return(db);
+}
 static DB* _db_alloc(int namelen)
 {
 	DB *db;
@@ -141,7 +223,7 @@ static void _db_free(DB *db)
 	free(db);
 }
 
-char * db_fetch(DBHANDLE h, const char * key)
+char *  db_fetch(DBHANDLE h, const char * key)
 {
 	DB *db = h;
 	char *ptr;
@@ -157,7 +239,7 @@ char * db_fetch(DBHANDLE h, const char * key)
 		db->cnt_fetchok++;
 	}
 	/*unlock the hash chain that _db_find_an_lock locked*/
-	if (unlock(db->idxfd, db->chainoff, SEEK_SET) < 0)
+	if (un_lock(db->idxfd, db->chainoff, SEEK_SET,1) < 0)
 		err_dump("db_fetch: unlock error");
 	return (ptr);
 }
@@ -304,7 +386,7 @@ int db_delete(DBHANDLE h, const char* key)
 		rc = -1;
 		db->cnt_delerr++;
 	}
-	if (unlockpt(db->idxfd, db->chainoff, SEEK_SET, 1) < 0)
+	if (un_lock(db->idxfd, db->chainoff, SEEK_SET, 1) < 0)
 		err_dump("db_delete: un_lock error");
 	return (rc);
 }
@@ -375,7 +457,7 @@ static void _db_writeidx(DB *db,const char* key,off_t offset,int whence,off_t pt
 		fmt = "%s%c%lld%c%d\n";
 	else
 		fmt = "%s%c%ld%c%d\n";
-	sprintf(asciiptrlen, "%*ld%*d", PTR_SZ, ptrval, IDXLEN_SZ, len);
+	sprintf(db->idxbuf, fmt, key, SEP, db->datoff, SEP, db->datlen);
 	//如果是appending,就得加锁
 	if (whence == SEEK_END)		/* we're appending */
 			if (writew_lock(db->idxfd, ((db->nhash+1)*PTR_SZ)+1,
@@ -542,7 +624,7 @@ static int _db_findfree(DB *db,int keylen,int datlen)
 	return(rc);
 }
 //将数据库重置到初始状态，将索引文件的文件偏移量定位到索引文件的第一条记录
-void rewind(DBHANDLE h)
+void db_rewind(DBHANDLE h)
 {
 	DB *db =h;
 	off_t offset;

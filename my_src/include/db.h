@@ -4,6 +4,7 @@
  *  Created on: 2015年9月11日
  *      Author: panzg
  */
+#include "head.h"
 
 #ifndef MY_SRC_INCLUDE_DB_H_
 #define MY_SRC_INCLUDE_DB_H_
@@ -12,7 +13,7 @@ typedef void* DBHANDLE;
 
 DBHANDLE db_open(const char*,int,...);
 void db_close(DBHANDLE);
-void *db_fetch(DBHANDLE,const char*);
+char *db_fetch(DBHANDLE,const char*);
 int db_store(DBHANDLE,const char*,const char*,int);
 int db_delete(DBHANDLE,const char*);
 void db_rewind(DBHANDLE);
@@ -67,7 +68,6 @@ typedef struct DB{
 	off_t chainoff;
 	off_t hashoff;
 	DBHASH nhash;
-	COUNT nhash;
 	 COUNT  cnt_delok;    /* delete OK */
 	  COUNT  cnt_delerr;   /* delete error */
 	  COUNT  cnt_fetchok;  /* fetch OK */

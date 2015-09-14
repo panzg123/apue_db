@@ -31,7 +31,7 @@
 #define max(a,b) ((a)>(b)?(a):(b))
 
 
-int lock_reg(int,int,int,off_t);
+int		lock_reg(int, int, int, off_t, int, off_t); /* {Prog lockreg} */
 #define read_lock(fd,offset,whence,len)  \
 	lock_reg((fd),F_SETLK,F_RDLCK,(offset),(whence),(len))
 #define	readw_lock(fd, offset, whence, len) \

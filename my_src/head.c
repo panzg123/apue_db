@@ -5,7 +5,7 @@
  *      Author: panzg
  */
 
-#include"./head.h"
+#include"include/head.h"
 #include<errno.h>
 #include<stdarg.h>
 #include<fcntl.h>
@@ -48,7 +48,7 @@ void err_dump(const char  *fmt,...)
 	va_list ap;
 	va_start(ap,fmt);
 	err_doit(1,errno,fmt,ap);
-	va_end();
+	va_end(ap);
 	abort(); /* dump core and terminate */
 	exit(1); /* shouldn't get here */
 }
@@ -61,7 +61,7 @@ void err_msg(const char* fmt,...)
 	va_list ap;
 	va_start(ap,fmt);
 	err_doit(0,0,fmt,ap);
-	va_end();
+	va_end(ap);
 }
 /*
  * Fatal error unrelated to a system call.
@@ -84,7 +84,8 @@ static void err_doit(int errnoflag,int error,const char* fmt,va_list ap)
 	char buf[MAXLINE];
 	vsnprintf(buf,MAXLINE,fmt,ap);
 	if(errnoflag)
-		snprinf(buf+strlen(buf),MAXLINE-strlen(buf),":%s",strerror(error));
+		snprintf(buf+strlen(buf), MAXLINE-strlen(buf), ": %s",
+				  strerror(error));
 	strcat(buf,"\n");
 	fflush(stdout);  /*in case stdout and stderr are the same*/
 	fputs(buf,stderr);
